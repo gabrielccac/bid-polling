@@ -23,6 +23,13 @@ type TokenData struct {
 	Source    string  `json:"source"`
 }
 
+func abs(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
 func main() {
 	if len(os.Args) < 4 {
 		fmt.Println("Usage: go run polling.go <bearer_token> <interval_ms> <num_workers>")
@@ -63,10 +70,16 @@ func main() {
 	}
 	fmt.Println("✅ Redis connection successful")
 
-	// Global atomic counters
+	// Global atomic counters  
 	var globalSuccessCounter int64
 	var globalRequestCounter int64
 	var lastPollTime int64 // For coverage monitoring
+	
+	// Coverage quality tracking
+	var totalGaps int64
+	var gapSum int64
+	var minGap int64 = 999999
+	var maxGap int64 = 0
 
 	// Get token from Redis queue
 	getTokenFromQueue := func(ctx context.Context) (*TokenData, error) {
@@ -175,7 +188,7 @@ func main() {
 		// Calculate stagger delay to distribute workers evenly
 		staggerDelay := interval / time.Duration(numWorkers)
 		workerStartDelay := time.Duration(workerID-1) * staggerDelay
-		
+
 		// Add initial stagger delay before starting polling
 		fmt.Printf("Worker %d starting with %v delay for staggered coverage\n", workerID, workerStartDelay)
 		time.Sleep(workerStartDelay)
@@ -218,13 +231,33 @@ func main() {
 				rtt := time.Since(start)
 
 				globalRequestSeq := atomic.AddInt64(&globalRequestCounter, 1)
-				
+
 				// Coverage monitoring - track intervals between polls
 				currentTime := time.Now().UnixMilli()
 				prevTime := atomic.SwapInt64(&lastPollTime, currentTime)
 				var intervalGap int64 = 0
 				if prevTime > 0 {
 					intervalGap = currentTime - prevTime
+					
+					// Update coverage statistics
+					atomic.AddInt64(&totalGaps, 1)
+					atomic.AddInt64(&gapSum, intervalGap)
+					
+					// Update min gap
+					for {
+						currentMin := atomic.LoadInt64(&minGap)
+						if intervalGap >= currentMin || atomic.CompareAndSwapInt64(&minGap, currentMin, intervalGap) {
+							break
+						}
+					}
+					
+					// Update max gap
+					for {
+						currentMax := atomic.LoadInt64(&maxGap)
+						if intervalGap <= currentMax || atomic.CompareAndSwapInt64(&maxGap, currentMax, intervalGap) {
+							break
+						}
+					}
 				}
 
 				tokenAge := time.Now().Unix() - int64(tokenData.Timestamp)
@@ -237,7 +270,7 @@ func main() {
 					updateStats(rtt, statusCode)
 
 					if statusCode == 200 {
-						// successSequence = atomic.AddInt64(&globalSuccessCounter, 1)
+						atomic.AddInt64(&globalSuccessCounter, 1)
 					}
 
 					// Parse response for bid information
@@ -276,29 +309,42 @@ func main() {
 		}
 	}
 
-	// Stats reporting goroutine
+	// Coverage reporting goroutine
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 
 		for {
 			select {
 			case <-ticker.C:
-				currentStats := getStats()
-				elapsed := time.Since(currentStats.startTime)
-				fmt.Printf("\n=== POLLING STATS (Elapsed: %v) ===\n", elapsed.Round(time.Second))
-				fmt.Printf("Total requests: %d | Success (200): %d | Rate limited (429): %d | Other: %d\n",
-					currentStats.count, currentStats.status200, currentStats.status429, currentStats.statusOther)
-				fmt.Printf("RTT - Avg: %v, Min: %v, Max: %v\n", currentStats.avgRTT, currentStats.minRTT, currentStats.maxRTT)
-				fmt.Printf("Request rate: %.2f req/sec\n", float64(currentStats.count)/elapsed.Seconds())
-				fmt.Println()
+				gaps := atomic.LoadInt64(&totalGaps)
+				if gaps > 0 {
+					sum := atomic.LoadInt64(&gapSum)
+					min := atomic.LoadInt64(&minGap)
+					max := atomic.LoadInt64(&maxGap)
+					avg := sum / gaps
+					
+					requests := atomic.LoadInt64(&globalRequestCounter)
+					successes := atomic.LoadInt64(&globalSuccessCounter)
+					
+					fmt.Printf("\n=== COVERAGE STATS ===\n")
+					fmt.Printf("Polling gaps: Avg: %dms | Min: %dms | Max: %dms\n", avg, min, max)
+					fmt.Printf("Coverage quality: %d gaps measured | Success rate: %.1f%%\n", 
+						gaps, float64(successes)/float64(requests)*100)
+					
+					// Calculate coverage consistency
+					expectedGap := int64(interval.Milliseconds()) / int64(numWorkers)
+					consistency := 100.0 - (float64(abs(avg-expectedGap))/float64(expectedGap))*100
+					fmt.Printf("Expected gap: %dms | Consistency: %.1f%%\n", expectedGap, consistency)
+					fmt.Println()
+				}
 			}
 		}
 	}()
 
 	staggerDelay := interval / time.Duration(numWorkers)
 	effectiveRate := time.Second / staggerDelay
-	
+
 	fmt.Printf("Starting staggered polling with %d workers at %v intervals\n", numWorkers, interval)
 	fmt.Printf("Stagger delay: %v per worker (effective rate: %.1f polls/sec)\n", staggerDelay, float64(effectiveRate))
 	fmt.Printf("Endpoint: %s\n", strings.Replace(urlPattern, "%s", "{token}", 1))
@@ -316,32 +362,40 @@ func main() {
 	// Wait for all workers to complete (will run indefinitely until Ctrl+C)
 	wg.Wait()
 
-	// Final statistics
+	// Final coverage statistics
 	finalStats := getStats()
-	finalSuccessCounter := atomic.LoadInt64(&globalSuccessCounter)
-	finalGlobalCounter := atomic.LoadInt64(&globalRequestCounter)
+	finalGaps := atomic.LoadInt64(&totalGaps)
+	finalRequests := atomic.LoadInt64(&globalRequestCounter)
+	finalSuccesses := atomic.LoadInt64(&globalSuccessCounter)
 	elapsed := time.Since(finalStats.startTime)
 
-	fmt.Printf("\n=== FINAL POLLING STATISTICS ===\n")
+	fmt.Printf("\n=== FINAL COVERAGE STATISTICS ===\n")
 	fmt.Printf("Total runtime: %v\n", elapsed.Round(time.Second))
-	fmt.Printf("Total global requests sent: %d\n", finalGlobalCounter)
-	fmt.Printf("Successful requests (200 status): %d\n", finalSuccessCounter)
-	fmt.Printf("RTT stats - Avg: %v, Min: %v, Max: %v\n", finalStats.avgRTT, finalStats.minRTT, finalStats.maxRTT)
-	fmt.Printf("Average request rate: %.2f req/sec\n", float64(finalStats.count)/elapsed.Seconds())
-
-	fmt.Printf("\n=== STATUS CODE BREAKDOWN ===\n")
-	fmt.Printf("200 (Success): %d\n", finalStats.status200)
-	fmt.Printf("429 (Rate Limited): %d\n", finalStats.status429)
-	fmt.Printf("Other Codes: %d\n", finalStats.statusOther)
-
-	if len(finalStats.statusCounts) > 0 {
-		fmt.Printf("\n=== DETAILED STATUS CODES ===\n")
-		for code, count := range finalStats.statusCounts {
-			if code == 0 {
-				fmt.Printf("Errors: %d\n", count)
-			} else {
-				fmt.Printf("Status %d: %d\n", code, count)
-			}
+	fmt.Printf("Total requests: %d | Successful: %d (%.1f%%)\n", 
+		finalRequests, finalSuccesses, float64(finalSuccesses)/float64(finalRequests)*100)
+	
+	if finalGaps > 0 {
+		finalSum := atomic.LoadInt64(&gapSum)
+		finalMin := atomic.LoadInt64(&minGap)
+		finalMax := atomic.LoadInt64(&maxGap)
+		finalAvg := finalSum / finalGaps
+		
+		expectedGap := int64(interval.Milliseconds()) / int64(numWorkers)
+		consistency := 100.0 - (float64(abs(finalAvg-expectedGap))/float64(expectedGap))*100
+		
+		fmt.Printf("\n=== COVERAGE QUALITY ===\n")
+		fmt.Printf("Polling gaps measured: %d\n", finalGaps)
+		fmt.Printf("Gap distribution: Avg: %dms | Min: %dms | Max: %dms\n", finalAvg, finalMin, finalMax)
+		fmt.Printf("Expected gap: %dms | Achieved consistency: %.1f%%\n", expectedGap, consistency)
+		fmt.Printf("Effective polling rate: %.2f polls/sec\n", float64(finalRequests)/elapsed.Seconds())
+		
+		// Coverage effectiveness
+		if consistency >= 90 {
+			fmt.Printf("✅ Excellent coverage - staggering working perfectly\n")
+		} else if consistency >= 75 {
+			fmt.Printf("⚠️  Good coverage - minor timing variations\n")
+		} else {
+			fmt.Printf("❌ Poor coverage - significant clustering detected\n")
 		}
 	}
 }
