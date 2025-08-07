@@ -66,6 +66,7 @@ func main() {
 	// Global atomic counters
 	var globalSuccessCounter int64
 	var globalRequestCounter int64
+	var lastPollTime int64 // For coverage monitoring
 
 	// Get token from Redis queue
 	getTokenFromQueue := func(ctx context.Context) (*TokenData, error) {
@@ -167,9 +168,17 @@ func main() {
 		}
 	}
 
-	// Worker function for continuous polling
+	// Worker function for continuous polling with staggered start
 	worker := func(workerID int, wg *sync.WaitGroup, stopChan <-chan struct{}) {
 		defer wg.Done()
+
+		// Calculate stagger delay to distribute workers evenly
+		staggerDelay := interval / time.Duration(numWorkers)
+		workerStartDelay := time.Duration(workerID-1) * staggerDelay
+		
+		// Add initial stagger delay before starting polling
+		fmt.Printf("Worker %d starting with %v delay for staggered coverage\n", workerID, workerStartDelay)
+		time.Sleep(workerStartDelay)
 
 		client := &fasthttp.Client{
 			MaxConnsPerHost:     10,
@@ -209,7 +218,14 @@ func main() {
 				rtt := time.Since(start)
 
 				globalRequestSeq := atomic.AddInt64(&globalRequestCounter, 1)
-				// var successSequence int64 = 0
+				
+				// Coverage monitoring - track intervals between polls
+				currentTime := time.Now().UnixMilli()
+				prevTime := atomic.SwapInt64(&lastPollTime, currentTime)
+				var intervalGap int64 = 0
+				if prevTime > 0 {
+					intervalGap = currentTime - prevTime
+				}
 
 				tokenAge := time.Now().Unix() - int64(tokenData.Timestamp)
 
@@ -240,8 +256,14 @@ func main() {
 					timestamp := time.Now().Format("15:04:05.0000")
 					timestamp = strings.Replace(timestamp, ".", ":", 1) // Turn HH:MM:SS.1234 into HH:MM:SS:1234
 
-					fmt.Printf("Worker %d Request #%d [Global #%d] - Status: %d @ %s\n",
-						workerID, requestCount, globalRequestSeq, statusCode, timestamp)
+					// Show interval gap for coverage monitoring
+					gapInfo := ""
+					if intervalGap > 0 {
+						gapInfo = fmt.Sprintf(" [gap: %dms]", intervalGap)
+					}
+
+					fmt.Printf("Worker %d Request #%d [Global #%d] - Status: %d @ %s%s\n",
+						workerID, requestCount, globalRequestSeq, statusCode, timestamp, gapInfo)
 
 				}
 
@@ -274,7 +296,11 @@ func main() {
 		}
 	}()
 
-	fmt.Printf("Starting continuous polling with %d workers at %v intervals\n", numWorkers, interval)
+	staggerDelay := interval / time.Duration(numWorkers)
+	effectiveRate := time.Second / staggerDelay
+	
+	fmt.Printf("Starting staggered polling with %d workers at %v intervals\n", numWorkers, interval)
+	fmt.Printf("Stagger delay: %v per worker (effective rate: %.1f polls/sec)\n", staggerDelay, float64(effectiveRate))
 	fmt.Printf("Endpoint: %s\n", strings.Replace(urlPattern, "%s", "{token}", 1))
 	fmt.Println("Press Ctrl+C to stop")
 
