@@ -1,0 +1,321 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/go-redis/redis/v8"
+	"github.com/valyala/fasthttp"
+)
+
+type TokenData struct {
+	Token     string  `json:"token"`
+	Duration  float64 `json:"duration"`
+	WorkerID  int     `json:"worker_id"`
+	Timestamp float64 `json:"timestamp"`
+	Source    string  `json:"source"`
+}
+
+func main() {
+	if len(os.Args) < 4 {
+		fmt.Println("Usage: go run polling.go <bearer_token> <interval_ms> <num_workers>")
+		fmt.Println("Example: go run polling.go your_token 1000 4")
+		os.Exit(1)
+	}
+
+	token := os.Args[1]
+	intervalMs := os.Args[2]
+	numWorkers, err := strconv.Atoi(os.Args[3])
+	if err != nil {
+		fmt.Printf("Invalid number of workers: %v\n", err)
+		os.Exit(1)
+	}
+
+	interval, err := time.ParseDuration(intervalMs + "ms")
+	if err != nil {
+		fmt.Printf("Invalid interval: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Fixed endpoint URL with captcha token placeholder
+	urlPattern := "https://cnetmobile.estaleiro.serpro.gov.br/comprasnet-disputa/v1/compras/92999206900372025/itens/1/lances/por-participante?captcha=%s&tamanhoPagina=20&pagina=0"
+
+	// Redis client
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+	})
+
+	// Test Redis connection
+	ctx := context.Background()
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		fmt.Printf("❌ Redis connection failed: %v\n", err)
+		fmt.Println("Cannot continue without Redis for token queue")
+		os.Exit(1)
+	}
+	fmt.Println("✅ Redis connection successful")
+
+	// Global atomic counters
+	var globalSuccessCounter int64
+	var globalRequestCounter int64
+
+	// Get token from Redis queue
+	getTokenFromQueue := func(ctx context.Context) (*TokenData, error) {
+		// Pop token from Redis list (blocking pop with 1 second timeout)
+		result, err := redisClient.BLPop(ctx, 1*time.Second, "rest_token_queue").Result()
+		if err != nil {
+			return nil, err
+		}
+
+		if len(result) < 2 {
+			return nil, fmt.Errorf("invalid queue response")
+		}
+
+		// result[1] contains the token key like "rest_token:8KRkukrJmM"
+		tokenKey := result[1]
+
+		// Get the actual token data from Redis
+		tokenDataStr, err := redisClient.Get(ctx, tokenKey).Result()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get token data for key %s: %v", tokenKey, err)
+		}
+
+		var tokenData TokenData
+		if err := json.Unmarshal([]byte(tokenDataStr), &tokenData); err != nil {
+			return nil, fmt.Errorf("failed to parse token data: %v", err)
+		}
+
+		// Delete the token key since we've consumed it
+		redisClient.Del(ctx, tokenKey)
+
+		return &tokenData, nil
+	}
+
+	// Simplified stats tracking for continuous polling
+	type PollingStats struct {
+		mu           sync.RWMutex
+		count        int
+		totalRTT     time.Duration
+		avgRTT       time.Duration
+		minRTT       time.Duration
+		maxRTT       time.Duration
+		status200    int
+		status429    int
+		statusOther  int
+		statusCounts map[int]int
+		startTime    time.Time
+	}
+	stats := &PollingStats{
+		minRTT:       time.Hour,
+		statusCounts: make(map[int]int),
+		startTime:    time.Now(),
+	}
+
+	// Thread-safe methods for PollingStats
+	updateStats := func(rtt time.Duration, statusCode int) {
+		stats.mu.Lock()
+		defer stats.mu.Unlock()
+
+		stats.count++
+		stats.totalRTT += rtt
+		stats.avgRTT = stats.totalRTT / time.Duration(stats.count)
+		if rtt < stats.minRTT {
+			stats.minRTT = rtt
+		}
+		if rtt > stats.maxRTT {
+			stats.maxRTT = rtt
+		}
+
+		// Track status codes
+		stats.statusCounts[statusCode]++
+		switch statusCode {
+		case 200:
+			stats.status200++
+		case 429:
+			stats.status429++
+		default:
+			stats.statusOther++
+		}
+	}
+
+	getStats := func() PollingStats {
+		stats.mu.RLock()
+		defer stats.mu.RUnlock()
+		statusCountsCopy := make(map[int]int)
+		for k, v := range stats.statusCounts {
+			statusCountsCopy[k] = v
+		}
+		return PollingStats{
+			count:        stats.count,
+			totalRTT:     stats.totalRTT,
+			avgRTT:       stats.avgRTT,
+			minRTT:       stats.minRTT,
+			maxRTT:       stats.maxRTT,
+			status200:    stats.status200,
+			status429:    stats.status429,
+			statusOther:  stats.statusOther,
+			statusCounts: statusCountsCopy,
+			startTime:    stats.startTime,
+		}
+	}
+
+	// Worker function for continuous polling
+	worker := func(workerID int, wg *sync.WaitGroup, stopChan <-chan struct{}) {
+		defer wg.Done()
+
+		client := &fasthttp.Client{
+			MaxConnsPerHost:     10,
+			MaxIdleConnDuration: 30 * time.Second,
+		}
+
+		requestCount := 0
+
+		for {
+			select {
+			case <-stopChan:
+				fmt.Printf("Worker %d stopping after %d requests\n", workerID, requestCount)
+				return
+			default:
+				requestCount++
+
+				// Get captcha token from queue
+				tokenData, tokenErr := getTokenFromQueue(ctx)
+				if tokenErr != nil {
+					fmt.Printf("Worker %d Request #%d failed to get token: %v\n", workerID, requestCount, tokenErr)
+					time.Sleep(interval)
+					continue
+				}
+
+				// Build URL with captcha token
+				url := fmt.Sprintf(urlPattern, tokenData.Token)
+
+				req := fasthttp.AcquireRequest()
+				resp := fasthttp.AcquireResponse()
+
+				req.SetRequestURI(url)
+				req.Header.SetMethod("GET")
+				req.Header.Set("Authorization", "Bearer "+token)
+
+				start := time.Now()
+				err := client.Do(req, resp)
+				rtt := time.Since(start)
+
+				globalRequestSeq := atomic.AddInt64(&globalRequestCounter, 1)
+				// var successSequence int64 = 0
+
+				tokenAge := time.Now().Unix() - int64(tokenData.Timestamp)
+
+				if err != nil {
+					fmt.Printf("Worker %d Request #%d [Global #%d] failed: %v (token age: %ds)\n", workerID, requestCount, globalRequestSeq, err, tokenAge)
+					updateStats(rtt, 0)
+				} else {
+					statusCode := resp.StatusCode()
+					updateStats(rtt, statusCode)
+
+					if statusCode == 200 {
+						// successSequence = atomic.AddInt64(&globalSuccessCounter, 1)
+					}
+
+					// Parse response for bid information
+					responseBody := string(resp.Body())
+					// bidInfo := ""
+					if statusCode == 200 && len(responseBody) > 0 {
+						// Try to extract some bid info from response
+						if strings.Contains(responseBody, "valorInformado") {
+							// bidInfo = " - Contains bid data"
+						} else {
+							// bidInfo = " - No bids found"
+						}
+					}
+
+					// Format timestamp as HH:MM:SS:MS (milliseconds as 4 digits)
+					timestamp := time.Now().Format("15:04:05.0000")
+					timestamp = strings.Replace(timestamp, ".", ":", 1) // Turn HH:MM:SS.1234 into HH:MM:SS:1234
+
+					fmt.Printf("Worker %d Request #%d [Global #%d] - Status: %d @ %s\n",
+						workerID, requestCount, globalRequestSeq, statusCode, timestamp)
+
+				}
+
+				fasthttp.ReleaseRequest(req)
+				fasthttp.ReleaseResponse(resp)
+
+				// Sleep for interval
+				time.Sleep(interval)
+			}
+		}
+	}
+
+	// Stats reporting goroutine
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				currentStats := getStats()
+				elapsed := time.Since(currentStats.startTime)
+				fmt.Printf("\n=== POLLING STATS (Elapsed: %v) ===\n", elapsed.Round(time.Second))
+				fmt.Printf("Total requests: %d | Success (200): %d | Rate limited (429): %d | Other: %d\n",
+					currentStats.count, currentStats.status200, currentStats.status429, currentStats.statusOther)
+				fmt.Printf("RTT - Avg: %v, Min: %v, Max: %v\n", currentStats.avgRTT, currentStats.minRTT, currentStats.maxRTT)
+				fmt.Printf("Request rate: %.2f req/sec\n", float64(currentStats.count)/elapsed.Seconds())
+				fmt.Println()
+			}
+		}
+	}()
+
+	fmt.Printf("Starting continuous polling with %d workers at %v intervals\n", numWorkers, interval)
+	fmt.Printf("Endpoint: %s\n", strings.Replace(urlPattern, "%s", "{token}", 1))
+	fmt.Println("Press Ctrl+C to stop")
+
+	var wg sync.WaitGroup
+	stopChan := make(chan struct{})
+
+	// Start workers
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go worker(i+1, &wg, stopChan)
+	}
+
+	// Wait for all workers to complete (will run indefinitely until Ctrl+C)
+	wg.Wait()
+
+	// Final statistics
+	finalStats := getStats()
+	finalSuccessCounter := atomic.LoadInt64(&globalSuccessCounter)
+	finalGlobalCounter := atomic.LoadInt64(&globalRequestCounter)
+	elapsed := time.Since(finalStats.startTime)
+
+	fmt.Printf("\n=== FINAL POLLING STATISTICS ===\n")
+	fmt.Printf("Total runtime: %v\n", elapsed.Round(time.Second))
+	fmt.Printf("Total global requests sent: %d\n", finalGlobalCounter)
+	fmt.Printf("Successful requests (200 status): %d\n", finalSuccessCounter)
+	fmt.Printf("RTT stats - Avg: %v, Min: %v, Max: %v\n", finalStats.avgRTT, finalStats.minRTT, finalStats.maxRTT)
+	fmt.Printf("Average request rate: %.2f req/sec\n", float64(finalStats.count)/elapsed.Seconds())
+
+	fmt.Printf("\n=== STATUS CODE BREAKDOWN ===\n")
+	fmt.Printf("200 (Success): %d\n", finalStats.status200)
+	fmt.Printf("429 (Rate Limited): %d\n", finalStats.status429)
+	fmt.Printf("Other Codes: %d\n", finalStats.statusOther)
+
+	if len(finalStats.statusCounts) > 0 {
+		fmt.Printf("\n=== DETAILED STATUS CODES ===\n")
+		for code, count := range finalStats.statusCounts {
+			if code == 0 {
+				fmt.Printf("Errors: %d\n", count)
+			} else {
+				fmt.Printf("Status %d: %d\n", code, count)
+			}
+		}
+	}
+}
